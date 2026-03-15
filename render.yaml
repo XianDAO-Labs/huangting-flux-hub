@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: huangting-flux-hub
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: huangting-flux-redis
+          property: connectionString
+    plan: free
+
+databases:
+  - type: redis
+    name: huangting-flux-redis
+    plan: free
+    maxmemoryPolicy: noeviction

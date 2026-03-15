@@ -5,11 +5,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import redis
 import json
-from typing import Literal, Dict
+from typing import Literal, Dict, Any
 
 # --- Configuration ---
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
+import os
+REDIS_URL = os.environ.get("REDIS_URL", None)
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 
 # --- Pydantic Models ---
 class MetricReport(BaseModel):
@@ -34,7 +36,10 @@ app.add_middleware(
 
 # --- Redis Connection ---
 try:
-    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+    if REDIS_URL:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    else:
+        redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
     redis_client.ping() # Check connection
     print("Successfully connected to Redis.")
 except redis.exceptions.ConnectionError as e:
