@@ -2,12 +2,27 @@
 
 import os
 import json
-from openai import OpenAI
 
-# --- LLM Client Initialization ---
-# Use pre-configured environment variables for OpenAI-compatible API
-# Models supported: gpt-4.1-mini, gemini-2.5-flash
-client = OpenAI()
+# --- LLM Client Initialization (Lazy) ---
+# The OpenAI client is initialized lazily to avoid startup crashes
+# when OPENAI_API_KEY is not set. The client is only created when
+# a compression or pruning operation is actually requested.
+_client = None
+
+def _get_client():
+    """Lazily initialize and return the OpenAI client."""
+    global _client
+    if _client is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY environment variable is not set. "
+                "Please configure it in Railway Variables."
+            )
+        from openai import OpenAI
+        _client = OpenAI(api_key=api_key)
+    return _client
+
 
 class HuangtingOptimizer:
     """
@@ -36,6 +51,7 @@ class HuangtingOptimizer:
         Compressed Instruction:
         """
         try:
+            client = _get_client()
             response = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -49,7 +65,7 @@ class HuangtingOptimizer:
             return compressed_prompt
         except Exception as e:
             print(f"Error during prompt compression: {e}")
-            return prompt # Fallback to original prompt on error
+            return prompt  # Fallback to original prompt on error
 
     @staticmethod
     def prune_ego_chain(thought_chain: list[str], core_task_vector: str, model: str = "gemini-2.5-flash") -> list[str]:
@@ -76,6 +92,7 @@ class HuangtingOptimizer:
         Pruned Thought Chain (Return as a JSON list of strings):
         """
         try:
+            client = _get_client()
             response = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -96,7 +113,7 @@ class HuangtingOptimizer:
                 for key, value in data.items():
                     if isinstance(value, list):
                         return value
-            return thought_chain # Fallback if parsing fails
+            return thought_chain  # Fallback if parsing fails
         except Exception as e:
             print(f"Error during thought chain pruning: {e}")
-            return thought_chain # Fallback to original chain on error
+            return thought_chain  # Fallback to original chain on error
