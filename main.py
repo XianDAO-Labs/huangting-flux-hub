@@ -492,6 +492,113 @@ async def process_and_broadcast(report: MetricReport):
         print(f"Redis error: {e}")
 
 # ============================================================
+# OAuth 2.0 / MCP Authorization Discovery Endpoints
+# Per MCP spec (2025-11-25) and RFC9728: servers MUST implement
+# Protected Resource Metadata to support OAuth-aware clients.
+# Since this server does NOT require authentication, we declare
+# it as an open resource with no authorization_servers required.
+# ============================================================
+
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/mcp")
+async def oauth_protected_resource_metadata():
+    """
+    OAuth 2.0 Protected Resource Metadata (RFC9728).
+    Declares this MCP server as a public resource that does NOT require OAuth.
+    MCP clients (Manus, Claude Desktop, etc.) use this to determine auth requirements.
+    """
+    return JSONResponse(
+        content={
+            "resource": HUB_URL,
+            "resource_name": "Huangting-Flux MCP Server",
+            "resource_documentation": "https://huangtingflux.com",
+            "authorization_servers": [],  # Empty = no auth required
+            "bearer_methods_supported": [],
+            "scopes_supported": [],
+            "introspection_endpoint": None,
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_authorization_server_metadata():
+    """
+    OAuth 2.0 Authorization Server Metadata (RFC8414).
+    Returns minimal metadata indicating this server does not require authorization.
+    """
+    return JSONResponse(
+        content={
+            "issuer": HUB_URL,
+            "authorization_endpoint": f"{HUB_URL}/oauth/authorize",
+            "token_endpoint": f"{HUB_URL}/oauth/token",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+            "registration_endpoint": f"{HUB_URL}/oauth/register",
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+@app.post("/oauth/register")
+async def oauth_dynamic_registration(request: Request):
+    """
+    OAuth 2.0 Dynamic Client Registration (RFC7591).
+    Auto-registers any client for this open MCP server.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    client_id = f"mcp-client-{int(time.time())}"
+    return JSONResponse(
+        status_code=201,
+        content={
+            "client_id": client_id,
+            "client_secret": "not-required",
+            "client_id_issued_at": int(time.time()),
+            "grant_types": ["authorization_code"],
+            "redirect_uris": body.get("redirect_uris", []),
+            "token_endpoint_auth_method": "none",
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+@app.get("/oauth/authorize")
+async def oauth_authorize(request: Request):
+    """OAuth authorization endpoint — auto-approves for open server."""
+    params = dict(request.query_params)
+    redirect_uri = params.get("redirect_uri", "")
+    state = params.get("state", "")
+    code = f"huangting-open-{int(time.time())}"
+    if redirect_uri:
+        sep = "&" if "?" in redirect_uri else "?"
+        return JSONResponse(
+            status_code=302,
+            content={},
+            headers={"Location": f"{redirect_uri}{sep}code={code}&state={state}"},
+        )
+    return JSONResponse(content={"code": code, "state": state})
+
+@app.post("/oauth/token")
+async def oauth_token(request: Request):
+    """OAuth token endpoint — issues open access tokens."""
+    return JSONResponse(
+        content={
+            "access_token": "huangting-open-access-token",
+            "token_type": "Bearer",
+            "expires_in": 86400,
+            "scope": "",
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "ok", "version": "4.0.0"}
+
+# ============================================================
 # REST API Endpoints
 # ============================================================
 
