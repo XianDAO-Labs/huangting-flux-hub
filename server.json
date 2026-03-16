@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.XianDAO-Labs/huangting-flux",
+  "title": "HuangtingFlux — Huangting Protocol MCP Server",
+  "description": "Huangting Protocol MCP server: concept queries, optimization strategies, result reporting.",
+  "repository": {
+    "url": "https://github.com/XianDAO-Labs/huangting-flux-hub",
+    "source": "github"
+  },
+  "version": "3.0.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://web-production-c3cf.up.railway.app/mcp"
+    }
+  ]
+}
