@@ -33,3 +33,9 @@ logs/
 
 # Docker
 .docker/
+
+# Secrets and tokens
+.mcpregistry_*
+*_token
+*_secret
+*.key
