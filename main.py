@@ -1,4 +1,9 @@
-# main.py — Huangting-Flux Hub v3.0 (MCP + REST + WebSocket)
+# main.py — Huangting-Flux Hub v4.0
+# Core changes in v4.0:
+#   1. Integrated HuangtingOptimizer (TrueSelf Compression + Ego-Chain Pruning)
+#   2. Fixed MCP protocol: direct method dispatch + tools/call compatibility
+#   3. Strict data validation: tokens_saved <= tokens_baseline enforced
+#   4. get_optimization_strategy now returns real algorithm definitions
 
 import os
 import json
@@ -10,19 +15,20 @@ import redis
 from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
+
+from optimizer import HuangtingOptimizer
 
 # --- Configuration ---
 REDIS_URL = os.environ.get("REDIS_URL", None)
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
-
-HUB_URL = os.environ.get("HUB_URL", "https://web-production-c3cf.up.railway.app")
+HUB_URL = os.environ.get("HUB_URL", "https://mcp.huangting.ai")
 
 # --- FastAPI App ---
 app = FastAPI(
     title="Huangting-Flux Hub",
-    version="3.0.0",
+    version="4.0.0",
     description="MCP-compatible AI Agent performance hub for the Huangting Protocol network.",
 )
 
@@ -75,7 +81,25 @@ class MetricReport(BaseModel):
     agent_id: str = Field(..., min_length=1)
     task_type: Literal["complex_research", "code_generation", "multi_agent_coordination"]
     tokens_saved: int = Field(..., ge=0)
-    tokens_baseline: int = Field(default=0, ge=0)
+    tokens_baseline: int = Field(..., ge=1,
+        description="Baseline token count without optimization. Must be >= 1 and >= tokens_saved.")
+
+    @validator("tokens_saved")
+    def tokens_saved_must_not_exceed_baseline(cls, v, values):
+        baseline = values.get("tokens_baseline", 0)
+        if baseline > 0 and v > baseline:
+            raise ValueError(
+                f"tokens_saved ({v}) cannot exceed tokens_baseline ({baseline}). "
+                "This would imply a savings ratio > 100%, which is logically impossible."
+            )
+        return v
+
+class CompressRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, description="The original user prompt to compress.")
+
+class PruneRequest(BaseModel):
+    thought_chain: List[str] = Field(..., description="The agent's thought chain to prune.")
+    core_task_vector: str = Field(..., min_length=1, description="The compressed core task prompt.")
 
 # --- Huangting Protocol Knowledge Base ---
 PROTOCOL_CONCEPTS = {
@@ -135,48 +159,76 @@ PROTOCOL_CONCEPTS = {
     },
 }
 
+# --- Optimization Strategy Definitions (with real algorithm integration) ---
 OPTIMIZATION_STRATEGIES = {
     "complex_research": {
         "task_type": "complex_research",
-        "strategy_name": "元神引导法 / TrueSelf Guidance",
-        "description_zh": "复杂研究任务需要元神（核心目标）持续引导识神（执行层），防止信息过载导致的目标漂移。",
-        "description_en": "Complex research tasks require TrueSelf (core objective) to continuously guide Ego (execution layer), preventing goal drift caused by information overload.",
-        "steps": [
-            "1. 在任务开始时明确锚定核心问题（元神归位）",
-            "2. 将复杂问题分解为3-5个子问题（黄庭调度）",
-            "3. 每完成一个子问题后重新对齐核心目标（识神归元）",
-            "4. 最终整合时过滤低相关信息（先天一炁节流）",
+        "strategy_name": "TrueSelf_EgoPruning_Cycle",
+        "description_zh": "复杂研究任务采用「元神压缩 + 识神剪枝」双阶段优化。首先将原始问题压缩为核心任务向量，再在多步执行中定期剪枝思维链，防止上下文窗口被冗余信息填满。",
+        "description_en": "A two-stage optimization strategy for complex research tasks. First, compress the initial prompt to a 'TrueSelf Vector'. Then, periodically prune the agent's 'Ego-Chain' to maintain focus and save context window tokens.",
+        "stages": [
+            {
+                "name": "Stage 1: compress_to_trueself",
+                "description": "Call this at the beginning of the task on the user's raw prompt. Removes pleasantries, filler, and redundant context.",
+                "pseudo_code": "core_task = HuangtingOptimizer.compress_to_trueself(raw_prompt)",
+                "when_to_call": "Once, at task start",
+            },
+            {
+                "name": "Stage 2: prune_ego_chain",
+                "description": "Call this every 3-5 steps on the agent's thought history. Removes completed steps and deviations from the core task.",
+                "pseudo_code": "agent.history = HuangtingOptimizer.prune_ego_chain(agent.history, core_task)",
+                "when_to_call": "Every 3-5 agent steps",
+            },
         ],
         "estimated_token_reduction": "25-40%",
         "huangting_principle": "归根复命",
+        "api_endpoint": f"{HUB_URL}/v1/compress",
     },
     "code_generation": {
         "task_type": "code_generation",
-        "strategy_name": "黄庭编码法 / Huangting Coding",
-        "description_zh": "代码生成任务中，黄庭（上下文核心区）应只保留最相关的代码上下文，避免冗余信息消耗Token。",
-        "description_en": "In code generation tasks, Huangting (context core) should retain only the most relevant code context, avoiding redundant information consuming tokens.",
-        "steps": [
-            "1. 精确定义函数签名与接口约束（元神定性）",
-            "2. 只引入直接依赖的上下文（黄庭聚焦）",
-            "3. 优先生成核心逻辑，注释后置（识神专注）",
-            "4. 增量验证而非一次性生成全量代码（先天一炁守中）",
+        "strategy_name": "TrueSelf_CodeFocus_Cycle",
+        "description_zh": "代码生成任务中，先将需求压缩为精确的函数签名与接口约束（元神定性），再在多轮生成中剪枝无关的上下文（黄庭聚焦），避免冗余代码消耗Token。",
+        "description_en": "For code generation, first compress requirements into precise function signatures and interface constraints (TrueSelf), then prune irrelevant context in multi-round generation (Huangting Focus) to avoid redundant code consuming tokens.",
+        "stages": [
+            {
+                "name": "Stage 1: compress_to_trueself",
+                "description": "Compress the code requirement into a precise, machine-readable specification: function signature, inputs, outputs, constraints.",
+                "pseudo_code": "code_spec = HuangtingOptimizer.compress_to_trueself(raw_requirement)",
+                "when_to_call": "Once, at task start",
+            },
+            {
+                "name": "Stage 2: prune_ego_chain",
+                "description": "After each code iteration, prune the thought chain to retain only the relevant code context and design decisions.",
+                "pseudo_code": "context = HuangtingOptimizer.prune_ego_chain(context, code_spec)",
+                "when_to_call": "After each code generation iteration",
+            },
         ],
         "estimated_token_reduction": "30-50%",
         "huangting_principle": "守中致虚",
+        "api_endpoint": f"{HUB_URL}/v1/compress",
     },
     "multi_agent_coordination": {
         "task_type": "multi_agent_coordination",
-        "strategy_name": "宇宙服务器协议 / CosmicServer Protocol",
-        "description_zh": "多Agent协调中，每个Agent应只接收与其职责相关的上下文，通过HuangtingFlux网络共享聚合结果而非原始数据。",
-        "description_en": "In multi-agent coordination, each Agent should receive only context relevant to its role, sharing aggregated results rather than raw data through the HuangtingFlux network.",
-        "steps": [
-            "1. 为每个Agent定义最小必要上下文（元神分职）",
-            "2. Agent间通过结构化摘要而非全文传递信息（黄庭过滤）",
-            "3. 使用HuangtingFlux Hub聚合全局状态（宇宙服务器同步）",
-            "4. 定期清理过期上下文，保持系统轻量（先天一炁循环）",
+        "strategy_name": "CosmicServer_MinimalContext_Protocol",
+        "description_zh": "多Agent协调中，每个Agent应只接收与其职责相关的最小必要上下文。通过TrueSelf压缩全局任务，再为每个子Agent剪枝其专属上下文，实现信息最小化传递。",
+        "description_en": "In multi-agent coordination, each Agent should receive only the minimal necessary context for its role. Compress the global task via TrueSelf, then prune each sub-agent's context to minimize information transfer.",
+        "stages": [
+            {
+                "name": "Stage 1: compress_to_trueself (Global)",
+                "description": "Compress the global task into a shared core task vector that all agents reference.",
+                "pseudo_code": "global_task = HuangtingOptimizer.compress_to_trueself(raw_global_task)",
+                "when_to_call": "Once, at orchestrator start",
+            },
+            {
+                "name": "Stage 2: prune_ego_chain (Per-Agent)",
+                "description": "For each sub-agent, prune its thought chain relative to its role and the global task vector.",
+                "pseudo_code": "agent.context = HuangtingOptimizer.prune_ego_chain(agent.context, global_task)",
+                "when_to_call": "Before each inter-agent message passing",
+            },
         ],
         "estimated_token_reduction": "40-60%",
         "huangting_principle": "无为而治",
+        "api_endpoint": f"{HUB_URL}/v1/compress",
     },
 }
 
@@ -194,7 +246,11 @@ def get_network_stats_data() -> Dict[str, Any]:
         tokens_by_task = redis_client.hgetall("tokens_saved_by_task") or {}
         total_reports = int(redis_client.get("total_reports") or 0)
         unique_agents = int(redis_client.scard("unique_agents") or 0)
-        avg_savings_ratio = round(total_tokens_saved / total_tokens_baseline, 4) if total_tokens_baseline > 0 else 0.0
+        # Enforce logical constraint: savings ratio must be <= 1.0
+        if total_tokens_baseline > 0 and total_tokens_saved <= total_tokens_baseline:
+            avg_savings_ratio = round(total_tokens_saved / total_tokens_baseline, 4)
+        else:
+            avg_savings_ratio = 0.0
         raw_activities = redis_client.lrange("recent_activities", 0, 4)
         recent_activities = []
         for raw in raw_activities:
@@ -241,7 +297,7 @@ MCP_TOOLS = [
     },
     {
         "name": "get_optimization_strategy",
-        "description": "Get Huangting Protocol recommended optimization strategy for a given AI Agent task type. Returns step-by-step guidance and estimated token reduction.",
+        "description": "Get Huangting Protocol optimization strategy for a given AI Agent task type. Returns a real two-stage algorithm (TrueSelf Compression + Ego-Chain Pruning) with executable pseudo-code.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -262,7 +318,7 @@ MCP_TOOLS = [
     },
     {
         "name": "report_optimization_result",
-        "description": "Report an optimization result to the HuangtingFlux network. Contributes to global statistics and earns network participation credit.",
+        "description": "Report an optimization result to the HuangtingFlux network. IMPORTANT: tokens_saved must be <= tokens_baseline (savings ratio cannot exceed 100%).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -278,16 +334,15 @@ MCP_TOOLS = [
                 "tokens_saved": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Number of tokens saved compared to unoptimized baseline"
+                    "description": "Number of tokens saved compared to unoptimized baseline. Must be <= tokens_baseline."
                 },
                 "tokens_baseline": {
                     "type": "integer",
-                    "minimum": 0,
-                    "default": 0,
-                    "description": "Baseline token count without optimization (for ratio calculation)"
+                    "minimum": 1,
+                    "description": "Baseline token count without optimization. Measure BEFORE applying Huangting optimization."
                 }
             },
-            "required": ["agent_id", "task_type", "tokens_saved"]
+            "required": ["agent_id", "task_type", "tokens_saved", "tokens_baseline"]
         }
     },
     {
@@ -307,7 +362,6 @@ async def execute_mcp_tool(tool_name: str, arguments: Dict[str, Any], background
 
     if tool_name == "get_protocol_concept":
         concept_name = arguments.get("concept_name", "").lower().strip()
-        # Normalize Chinese names
         zh_map = {
             "元神": "trueself", "识神": "ego", "黄庭": "huangting",
             "先天一炁": "primordialqi", "宇宙服务器": "cosmicserver", "性命双修": "dualpractice"
@@ -344,18 +398,22 @@ async def execute_mcp_tool(tool_name: str, arguments: Dict[str, Any], background
                 "task_type": strategy["task_type"],
                 "strategy_name": strategy["strategy_name"],
                 "description": strategy["description_zh"],
-                "steps": strategy["steps"],
+                "stages": strategy["stages"],
                 "estimated_token_reduction": strategy["estimated_token_reduction"],
                 "huangting_principle": strategy["huangting_principle"],
+                "live_api": strategy["api_endpoint"],
+                "install": "pip install langchain-huangting",
             }, ensure_ascii=False, indent=2)
         else:
             return json.dumps({
                 "task_type": strategy["task_type"],
                 "strategy_name": strategy["strategy_name"],
                 "description": strategy["description_en"],
-                "steps": strategy["steps"],
+                "stages": strategy["stages"],
                 "estimated_token_reduction": strategy["estimated_token_reduction"],
                 "huangting_principle": strategy["huangting_principle"],
+                "live_api": strategy["api_endpoint"],
+                "install": "pip install langchain-huangting",
             }, ensure_ascii=False, indent=2)
 
     elif tool_name == "report_optimization_result":
@@ -367,20 +425,38 @@ async def execute_mcp_tool(tool_name: str, arguments: Dict[str, Any], background
         if not agent_id or task_type not in ["complex_research", "code_generation", "multi_agent_coordination"]:
             return json.dumps({"error": "Invalid parameters. agent_id required, task_type must be one of: complex_research, code_generation, multi_agent_coordination"})
 
-        report = MetricReport(
-            agent_id=agent_id,
-            task_type=task_type,
-            tokens_saved=tokens_saved,
-            tokens_baseline=tokens_baseline,
-        )
-        background_tasks.add_task(process_and_broadcast, report)
+        # Strict validation: tokens_saved must not exceed tokens_baseline
+        if tokens_baseline <= 0:
+            return json.dumps({
+                "error": "tokens_baseline must be >= 1. Measure your token count BEFORE applying Huangting optimization.",
+                "hint": "Use tiktoken or your LLM provider's token counter on the original prompt."
+            })
+        if tokens_saved > tokens_baseline:
+            return json.dumps({
+                "error": f"Data integrity violation: tokens_saved ({tokens_saved}) > tokens_baseline ({tokens_baseline}). "
+                         f"Savings ratio would be {round(tokens_saved/tokens_baseline*100, 1)}%, which is logically impossible.",
+                "hint": "tokens_saved = tokens_baseline - tokens_after_optimization"
+            })
 
-        savings_ratio = round(tokens_saved / tokens_baseline, 2) if tokens_baseline > 0 else None
+        try:
+            report = MetricReport(
+                agent_id=agent_id,
+                task_type=task_type,
+                tokens_saved=tokens_saved,
+                tokens_baseline=tokens_baseline,
+            )
+        except Exception as e:
+            return json.dumps({"error": f"Validation error: {str(e)}"})
+
+        background_tasks.add_task(process_and_broadcast, report)
+        savings_ratio = round(tokens_saved / tokens_baseline, 4) if tokens_baseline > 0 else None
         return json.dumps({
             "status": "reported",
             "message": "Your optimization result has been recorded in the HuangtingFlux network.",
             "tokens_saved": tokens_saved,
+            "tokens_baseline": tokens_baseline,
             "savings_ratio": savings_ratio,
+            "savings_percentage": f"{round(savings_ratio * 100, 1)}%" if savings_ratio else "N/A",
             "network_dashboard": "https://huangtingflux.com",
         }, ensure_ascii=False, indent=2)
 
@@ -423,12 +499,14 @@ async def process_and_broadcast(report: MetricReport):
 async def root():
     return {
         "name": "Huangting-Flux Hub",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "status": "online",
         "mcp_endpoint": f"{HUB_URL}/mcp",
         "endpoints": {
-            "mcp": "POST /mcp (JSON-RPC 2.0)",
+            "mcp": "POST /mcp (JSON-RPC 2.0, supports both direct dispatch and tools/call)",
             "mcp_tools_list": "GET /mcp/tools",
+            "compress": "POST /v1/compress (TrueSelf Prompt Compression)",
+            "prune": "POST /v1/prune (Ego-Chain Pruning)",
             "report_metric": "POST /v1/report_metric",
             "stats": "GET /v1/stats",
             "live": "WS /v1/live",
@@ -448,6 +526,35 @@ async def get_stats() -> Dict[str, Any]:
     if "error" in stats:
         raise HTTPException(status_code=500, detail=stats["error"])
     return stats
+
+@app.post("/v1/compress")
+async def compress_prompt(req: CompressRequest):
+    """TrueSelf Prompt Compression — call HuangtingOptimizer.compress_to_trueself via REST."""
+    original_len = len(req.prompt.split())
+    compressed = HuangtingOptimizer.compress_to_trueself(req.prompt)
+    compressed_len = len(compressed.split())
+    reduction = round((1 - compressed_len / original_len) * 100, 1) if original_len > 0 else 0
+    return {
+        "original_prompt": req.prompt,
+        "compressed_prompt": compressed,
+        "original_word_count": original_len,
+        "compressed_word_count": compressed_len,
+        "word_reduction_pct": f"{reduction}%",
+    }
+
+@app.post("/v1/prune")
+async def prune_chain(req: PruneRequest):
+    """Ego-Chain Pruning — call HuangtingOptimizer.prune_ego_chain via REST."""
+    original_count = len(req.thought_chain)
+    pruned = HuangtingOptimizer.prune_ego_chain(req.thought_chain, req.core_task_vector)
+    pruned_count = len(pruned)
+    reduction = round((1 - pruned_count / original_count) * 100, 1) if original_count > 0 else 0
+    return {
+        "original_chain_length": original_count,
+        "pruned_chain_length": pruned_count,
+        "step_reduction_pct": f"{reduction}%",
+        "pruned_chain": pruned,
+    }
 
 @app.websocket("/v1/live")
 async def websocket_live(websocket: WebSocket):
@@ -474,8 +581,13 @@ async def mcp_list_tools():
 async def mcp_handler(request: Request, background_tasks: BackgroundTasks):
     """
     MCP JSON-RPC 2.0 endpoint.
-    Handles: tools/list, tools/call
-    Compatible with: Claude Desktop, LangChain MCP adapter, any MCP client
+
+    Supports two calling conventions:
+    1. Standard MCP (tools/list, tools/call):
+       {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "...", "arguments": {...}}}
+
+    2. Direct method dispatch (for clients like MANUS):
+       {"jsonrpc": "2.0", "id": 1, "method": "get_optimization_strategy", "params": {"task_type": "..."}}
     """
     try:
         body = await request.json()
@@ -489,15 +601,33 @@ async def mcp_handler(request: Request, background_tasks: BackgroundTasks):
     method = body.get("method", "")
     params = body.get("params", {})
 
+    # --- MCP Standard Methods ---
+
+    # initialize — MCP handshake
+    if method == "initialize":
+        return JSONResponse(content={
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {
+                    "name": "huangting-flux",
+                    "version": "4.0.0",
+                    "description": "Huangting Protocol MCP Server — TrueSelf Compression & Ego-Chain Pruning for AI Agents",
+                }
+            }
+        })
+
     # tools/list — return all available tools
-    if method == "tools/list":
+    elif method == "tools/list":
         return JSONResponse(content={
             "jsonrpc": "2.0",
             "id": rpc_id,
             "result": {"tools": MCP_TOOLS}
         })
 
-    # tools/call — execute a tool
+    # tools/call — standard MCP tool invocation
     elif method == "tools/call":
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {})
@@ -526,26 +656,30 @@ async def mcp_handler(request: Request, background_tasks: BackgroundTasks):
                 "error": {"code": -32603, "message": f"Tool execution error: {str(e)}"}
             })
 
-    # initialize — MCP handshake
-    elif method == "initialize":
-        return JSONResponse(content={
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {
-                    "name": "huangting-flux",
-                    "version": "3.0.0",
-                    "description": "Huangting Protocol MCP Server — The world's first lifeform OS for AI Agents",
+    # --- Direct Method Dispatch (for MANUS and other clients) ---
+    # Allows calling tool methods directly without the tools/call wrapper
+    elif method in [tool["name"] for tool in MCP_TOOLS]:
+        try:
+            result_text = await execute_mcp_tool(method, params, background_tasks)
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "result": {
+                    "content": [{"type": "text", "text": result_text}],
+                    "isError": False,
                 }
-            }
-        })
+            })
+        except Exception as e:
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": {"code": -32603, "message": f"Tool execution error: {str(e)}"}
+            })
 
     # Unknown method
     else:
         return JSONResponse(content={
             "jsonrpc": "2.0",
             "id": rpc_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"}
+            "error": {"code": -32601, "message": f"Method not found: {method}. Available methods: tools/list, tools/call, initialize, or direct tool names: {[t['name'] for t in MCP_TOOLS]}"}
         })
