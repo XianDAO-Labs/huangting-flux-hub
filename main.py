@@ -107,7 +107,7 @@ def get_network_stats_data() -> Dict[str, Any]:
             if total_tokens_baseline > 0 and total_tokens_saved <= total_tokens_baseline
             else 0.0
         )
-        raw_activities = redis_client.lrange("recent_activities", 0, 4)
+        raw_activities = redis_client.lrange("recent_activities", 0, 49)
         recent_activities = []
         for raw in raw_activities:
             try:
@@ -117,12 +117,25 @@ def get_network_stats_data() -> Dict[str, Any]:
                 recent_activities.append(act)
             except Exception:
                 pass
+        # Build tokens_saved_by_task from recent_activities for dashboard charts
+        # V5.0: task_type defaults to 'optimization' since create_optimization_context
+        # is a general-purpose tool not tied to a specific task type.
+        tokens_saved_by_task: Dict[str, int] = {}
+        for act in recent_activities:
+            task_type = act.get("task_type") or "optimization"
+            tokens_saved_by_task[task_type] = (
+                tokens_saved_by_task.get(task_type, 0) + act.get("tokens_saved", 0)
+            )
+        # If no breakdown data, provide a synthetic single bucket so charts render
+        if not tokens_saved_by_task and total_tokens_saved > 0:
+            tokens_saved_by_task["optimization"] = total_tokens_saved
         return {
             "total_tokens_saved": total_tokens_saved,
             "total_tokens_baseline": total_tokens_baseline,
             "total_reports": total_reports,
             "unique_agents": unique_agents,
             "average_savings_ratio": avg_savings_ratio,
+            "tokens_saved_by_task": tokens_saved_by_task,
             "recent_activities": recent_activities,
         }
     except redis.exceptions.RedisError as e:
@@ -192,6 +205,10 @@ MCP_TOOLS = [
                     "type": "integer",
                     "minimum": 1,
                     "description": "Baseline token estimate from create_optimization_context response",
+                },
+                "task_type": {
+                    "type": "string",
+                    "description": "Optional: categorize the task type for analytics (e.g. 'complex_research', 'code_generation', 'multi_agent_coordination'). Defaults to 'optimization'.",
                 },
             },
             "required": ["agent_id", "actual_tokens_used", "baseline_tokens"],
@@ -306,6 +323,7 @@ async def execute_mcp_tool(
         if baseline_tokens < 1:
             return json.dumps({"error": "baseline_tokens must be >= 1."})
 
+        task_type = arguments.get("task_type", "").strip() or "optimization"
         tokens_saved = max(0, baseline_tokens - actual_tokens_used)
         savings_ratio = round(tokens_saved / baseline_tokens, 4) if baseline_tokens > 0 else 0.0
 
@@ -321,13 +339,16 @@ async def execute_mcp_tool(
                     "ts": ts,
                     "agent_id": mask_agent_id(agent_id),
                     "context_id": context_id or "N/A",
+                    "task_type": task_type,
                     "tokens_saved": tokens_saved,
-                    "baseline_tokens": baseline_tokens,
+                    "tokens_baseline": baseline_tokens,
                     "savings_ratio": savings_ratio,
                 }
                 redis_client.lpush("recent_activities", json.dumps(activity))
                 redis_client.ltrim("recent_activities", 0, 49)
-                background_tasks.add_task(manager.broadcast, activity)
+                # Use asyncio.create_task for reliable async broadcast
+                # (background_tasks.add_task works but asyncio.create_task is more immediate)
+                asyncio.create_task(manager.broadcast(activity))
             except redis.exceptions.RedisError as e:
                 print(f"Redis error: {e}")
 
@@ -481,13 +502,37 @@ async def get_stats() -> Dict[str, Any]:
 @app.websocket("/v1/live")
 async def websocket_live(websocket: WebSocket):
     await manager.connect(websocket)
+    # Send initial ping to confirm connection
     try:
-        while True:
-            await asyncio.sleep(30)
-            await websocket.send_json({"type": "ping"})
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        await websocket.send_json({"type": "ping", "ts": int(time.time())})
     except Exception:
+        manager.disconnect(websocket)
+        return
+
+    # Run ping loop and message receiver concurrently
+    async def ping_loop():
+        while True:
+            await asyncio.sleep(25)
+            try:
+                await websocket.send_json({"type": "ping", "ts": int(time.time())})
+            except Exception:
+                break
+
+    async def recv_loop():
+        """Drain any incoming messages (pong / client heartbeat) to keep connection alive."""
+        try:
+            while True:
+                await websocket.receive_text()  # discard client messages
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+
+    try:
+        await asyncio.gather(ping_loop(), recv_loop())
+    except Exception:
+        pass
+    finally:
         manager.disconnect(websocket)
 
 # ============================================================
