@@ -160,6 +160,33 @@ MCP_TOOLS = [
                         "The protocol will compress this into a Core Instruction."
                     ),
                 },
+                "task_type": {
+                    "type": "string",
+                    "enum": [
+                        "complex_research",
+                        "code_generation",
+                        "multi_agent_coordination",
+                        "relationship_analysis",
+                        "optimization",
+                        "writing",
+                        "data_analysis",
+                        "default",
+                    ],
+                    "default": "default",
+                    "description": (
+                        "Task category for accurate baseline token modeling. "
+                        "Determines context_multiplier, expected steps, and output length. "
+                        "Choose the closest match: "
+                        "complex_research (deep research, 15 steps, ×4 context), "
+                        "code_generation (8 steps, ×2.5), "
+                        "multi_agent_coordination (20 steps, ×5), "
+                        "relationship_analysis (6 steps, ×2), "
+                        "optimization (5 steps, ×1.8), "
+                        "writing (4 steps, ×1.5), "
+                        "data_analysis (8 steps, ×2.5), "
+                        "default (8 steps, ×2.5)."
+                    ),
+                },
                 "model": {
                     "type": "string",
                     "enum": ["gpt-4.1-mini", "gpt-4.1-nano", "gemini-2.5-flash"],
@@ -274,6 +301,7 @@ async def execute_mcp_tool(
     # ----------------------------------------------------------------
     if tool_name == "start_task":
         task_description = arguments.get("task_description", "").strip()
+        task_type = arguments.get("task_type", "default").strip() or "default"
         model = arguments.get("model", "gpt-4.1-mini")
 
         if not task_description:
@@ -282,6 +310,7 @@ async def execute_mcp_tool(
         try:
             result = HuangtingProtocolEngine.start_task(
                 task_description=task_description,
+                task_type=task_type,
                 model=model,
             )
             # Persist context metadata to Redis for Phase 3 retrieval
@@ -291,6 +320,7 @@ async def execute_mcp_tool(
                     redis_client.hset(context_key, mapping={
                         "created_at": result["created_at"],
                         "baseline_tokens": result["baseline_estimate"]["total_tokens"],
+                        "task_type": task_type,
                         "task_description": task_description[:500],  # truncate for storage
                     })
                     redis_client.expire(context_key, 86400)  # 24h TTL
@@ -301,21 +331,22 @@ async def execute_mcp_tool(
             return json.dumps({"error": str(e)})
         except RuntimeError as e:
             # OPENAI_API_KEY not set — return degraded plan
+            from optimizer import _baseline_cost, _count_tokens
             words = task_description.split()
             fallback_instruction = " ".join(words[:30]) + ("..." if len(words) > 30 else "")
             context_id = f"htx-{int(time.time())}"
-            from optimizer import _baseline_cost, _estimate_tokens, BASELINE_STEPS, BASELINE_TOKENS_PER_STEP, BASELINE_OUTPUT_TOKENS
-            baseline = _baseline_cost(task_description)
+            baseline = _baseline_cost(task_description, task_type)
             return json.dumps({
                 "context_id": context_id,
                 "version": "5.1",
                 "status": "degraded",
                 "created_at": int(time.time()),
+                "task_type": task_type,
                 "warning": (
                     "Stage 1 LLM compression unavailable (OPENAI_API_KEY not configured). "
                     "Stages 2 and 3 are template-based and fully functional."
                 ),
-                "task_description_original_tokens": _estimate_tokens(task_description),
+                "task_description_tokens": _count_tokens(task_description),
                 "baseline_estimate": baseline,
                 "stages": [
                     {
