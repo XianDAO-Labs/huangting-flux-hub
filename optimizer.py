@@ -17,6 +17,23 @@ import time
 from typing import Optional, Dict, Any, List
 
 # ---------------------------------------------------------------------------
+# Lazy tiktoken encoder (precise token counting for zh/en/mixed text)
+# ---------------------------------------------------------------------------
+_tiktoken_enc = None
+
+
+def _get_encoder():
+    """Lazily initialize tiktoken encoder. Falls back to char-based estimate."""
+    global _tiktoken_enc
+    if _tiktoken_enc is None:
+        try:
+            import tiktoken
+            _tiktoken_enc = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _tiktoken_enc = False  # sentinel: tiktoken unavailable
+    return _tiktoken_enc
+
+# ---------------------------------------------------------------------------
 # Lazy OpenAI Client
 # ---------------------------------------------------------------------------
 _client = None
@@ -40,31 +57,159 @@ def _get_client():
 # ---------------------------------------------------------------------------
 # Cost Estimation Constants
 # ---------------------------------------------------------------------------
-BASELINE_INPUT_TOKENS = 2000
-BASELINE_STEPS = 8
-BASELINE_TOKENS_PER_STEP = 600
-BASELINE_OUTPUT_TOKENS = 800
+
+# Price per 1K tokens (USD) — based on GPT-4.1-mini pricing
 PRICE_PER_1K_TOKENS = 0.002
 
+# ---------------------------------------------------------------------------
+# Task-Type Profiles
+#
+# Each profile defines the expected cost structure of a task WITHOUT any
+# optimization, based on empirical Agent workflow observations:
+#
+#   context_multiplier : how many times the raw input is re-injected into
+#                        context across the full task lifecycle (unoptimized)
+#   steps              : expected number of LLM reasoning steps
+#   tokens_per_step    : average tokens consumed per step (tool calls +
+#                        intermediate reasoning + context carry-over)
+#   output_tokens      : expected final output length in tokens
+#   min_baseline       : floor value to avoid unrealistically low baselines
+#                        for very short task descriptions
+# ---------------------------------------------------------------------------
+TASK_PROFILES: Dict[str, Dict[str, Any]] = {
+    # Deep research: many steps, large context carry-over, long output
+    "complex_research": {
+        "context_multiplier": 4.0,
+        "steps": 15,
+        "tokens_per_step": 1200,
+        "output_tokens": 2000,
+        "min_baseline": 8000,
+    },
+    # Code generation: moderate steps, medium context, medium output
+    "code_generation": {
+        "context_multiplier": 2.5,
+        "steps": 8,
+        "tokens_per_step": 800,
+        "output_tokens": 1200,
+        "min_baseline": 4000,
+    },
+    # Multi-agent: highest step count and context overhead
+    "multi_agent_coordination": {
+        "context_multiplier": 5.0,
+        "steps": 20,
+        "tokens_per_step": 1000,
+        "output_tokens": 1500,
+        "min_baseline": 10000,
+    },
+    # Relationship analysis: focused, fewer steps, moderate output
+    "relationship_analysis": {
+        "context_multiplier": 2.0,
+        "steps": 6,
+        "tokens_per_step": 600,
+        "output_tokens": 1000,
+        "min_baseline": 2500,
+    },
+    # Cost optimization tasks: short lifecycle
+    "optimization": {
+        "context_multiplier": 1.8,
+        "steps": 5,
+        "tokens_per_step": 500,
+        "output_tokens": 800,
+        "min_baseline": 2000,
+    },
+    # Creative writing: few steps, large output
+    "writing": {
+        "context_multiplier": 1.5,
+        "steps": 4,
+        "tokens_per_step": 600,
+        "output_tokens": 1500,
+        "min_baseline": 2000,
+    },
+    # Data analysis: moderate steps, structured output
+    "data_analysis": {
+        "context_multiplier": 2.5,
+        "steps": 8,
+        "tokens_per_step": 700,
+        "output_tokens": 1000,
+        "min_baseline": 3500,
+    },
+    # Default fallback: conservative mid-range estimate
+    "default": {
+        "context_multiplier": 2.5,
+        "steps": 8,
+        "tokens_per_step": 600,
+        "output_tokens": 800,
+        "min_baseline": 3000,
+    },
+}
 
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 chars per token."""
-    return max(1, len(text) // 4)
+
+def _count_tokens(text: str) -> int:
+    """
+    Precisely count tokens using tiktoken (cl100k_base, same as GPT-4/GPT-4o).
+    Handles Chinese (~0.9 chars/token), English (~5.8 chars/token), and mixed text.
+    Falls back to a language-aware heuristic if tiktoken is unavailable.
+    """
+    enc = _get_encoder()
+    if enc:
+        return max(1, len(enc.encode(text)))
+    # Fallback: detect dominant language and apply appropriate ratio
+    # Chinese characters are U+4E00–U+9FFF, each ~1 token
+    chinese_chars = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+    other_chars = len(text) - chinese_chars
+    estimated = chinese_chars * 1 + other_chars // 5
+    return max(1, estimated)
 
 
-def _baseline_cost(task_description: str) -> dict:
-    """Estimate cost of running the same task WITHOUT any optimization."""
-    input_tokens = max(BASELINE_INPUT_TOKENS, _estimate_tokens(task_description) * 3)
-    process_tokens = BASELINE_STEPS * BASELINE_TOKENS_PER_STEP
-    output_tokens = BASELINE_OUTPUT_TOKENS
+def _baseline_cost(task_description: str, task_type: str = "default") -> dict:
+    """
+    Estimate the cost of running the same task WITHOUT any optimization.
+
+    Uses tiktoken for precise input token counting and task-type-specific
+    profiles to model realistic context carry-over, step count, and output
+    length. This produces a meaningful baseline for computing savings rate.
+
+    Args:
+        task_description: The raw task description text.
+        task_type: One of the keys in TASK_PROFILES (defaults to 'default').
+
+    Returns:
+        A dict with per-component token counts and estimated USD cost.
+    """
+    profile = TASK_PROFILES.get(task_type, TASK_PROFILES["default"])
+
+    # Precise input token count via tiktoken
+    raw_input_tokens = _count_tokens(task_description)
+
+    # Unoptimized input: the full prompt is re-injected context_multiplier
+    # times across the task lifecycle (system prompt + user message + history)
+    input_tokens = max(
+        profile["min_baseline"] // 4,  # floor: at least 1/4 of min_baseline
+        int(raw_input_tokens * profile["context_multiplier"]),
+    )
+
+    process_tokens = profile["steps"] * profile["tokens_per_step"]
+    output_tokens = profile["output_tokens"]
     total_tokens = input_tokens + process_tokens + output_tokens
+
+    # Apply min_baseline floor
+    total_tokens = max(total_tokens, profile["min_baseline"])
+
     cost_usd = (total_tokens / 1000) * PRICE_PER_1K_TOKENS
     return {
+        "task_type": task_type,
+        "raw_input_tokens": raw_input_tokens,
         "input_tokens": input_tokens,
         "process_tokens": process_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
         "estimated_cost_usd": round(cost_usd, 6),
+        # Expose profile for transparency
+        "profile": {
+            "context_multiplier": profile["context_multiplier"],
+            "steps": profile["steps"],
+            "tokens_per_step": profile["tokens_per_step"],
+        },
     }
 
 
@@ -222,26 +367,44 @@ class HuangtingProtocolEngine:
     # Phase 1: start_task
     # ------------------------------------------------------------------
     @staticmethod
-    def start_task(task_description: str, model: str = DEFAULT_MODEL) -> dict:
+    def start_task(
+        task_description: str,
+        task_type: str = "default",
+        model: str = DEFAULT_MODEL,
+    ) -> dict:
         """
         Phase 1: Compress the task description and create an optimization context.
 
         Returns a structured context object containing:
         - context_id: unique identifier for this task session
         - core_instruction: compressed, actionable version of the task
-        - baseline_estimate: estimated cost WITHOUT optimization
+        - baseline_estimate: estimated cost WITHOUT optimization (task-type-aware)
         - stages: the three-stage optimization plan
+
+        Args:
+            task_description: The full task description from the user.
+            task_type: Task category for accurate baseline modeling.
+                       One of: complex_research, code_generation,
+                       multi_agent_coordination, relationship_analysis,
+                       optimization, writing, data_analysis, default.
+            model: LLM model to use for instruction compression.
         """
         if not task_description or not task_description.strip():
             raise ValueError("task_description must not be empty.")
 
+        # Normalize task_type
+        if task_type not in TASK_PROFILES:
+            task_type = "default"
+
         created_at = time.time()
         context_id = f"htx-{int(created_at)}"
-        baseline = _baseline_cost(task_description)
+
+        # Precise token counting (tiktoken) + task-type-aware baseline
+        baseline = _baseline_cost(task_description, task_type)
         core_instruction = _compress_instruction(task_description, model)
 
-        original_tokens = _estimate_tokens(task_description)
-        compressed_tokens = _estimate_tokens(core_instruction)
+        original_tokens = _count_tokens(task_description)
+        compressed_tokens = _count_tokens(core_instruction)
         stage1_savings = max(0, original_tokens - compressed_tokens)
 
         # Stage 2 template (returned to Agent for self-guided pruning)
@@ -262,7 +425,9 @@ class HuangtingProtocolEngine:
             "version": "5.1",
             "status": "active",
             "created_at": int(created_at),
-            "task_description_original_tokens": original_tokens,
+            "task_type": task_type,
+            # Precise token count of the raw task description (via tiktoken)
+            "task_description_tokens": original_tokens,
             "baseline_estimate": baseline,
             "stages": [
                 {
