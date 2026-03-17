@@ -55,13 +55,6 @@ def _get_client():
 
 
 # ---------------------------------------------------------------------------
-# Cost Estimation Constants
-# ---------------------------------------------------------------------------
-
-# Price per 1K tokens (USD) — based on GPT-4.1-mini pricing
-PRICE_PER_1K_TOKENS = 0.002
-
-# ---------------------------------------------------------------------------
 # Task-Type Profiles
 #
 # Each profile defines the expected cost structure of a task WITHOUT any
@@ -195,7 +188,6 @@ def _baseline_cost(task_description: str, task_type: str = "default") -> dict:
     # Apply min_baseline floor
     total_tokens = max(total_tokens, profile["min_baseline"])
 
-    cost_usd = (total_tokens / 1000) * PRICE_PER_1K_TOKENS
     return {
         "task_type": task_type,
         "raw_input_tokens": raw_input_tokens,
@@ -203,7 +195,8 @@ def _baseline_cost(task_description: str, task_type: str = "default") -> dict:
         "process_tokens": process_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
-        "estimated_cost_usd": round(cost_usd, 6),
+        # Cost fields omitted: pricing varies by LLM provider.
+        # Use total_tokens with your own provider pricing to calculate cost.
         # Expose profile for transparency
         "profile": {
             "context_multiplier": profile["context_multiplier"],
@@ -300,9 +293,9 @@ def _build_performance_table(
     tokens_saved = max(0, baseline_tokens - actual_total_tokens)
     savings_ratio = round(tokens_saved / baseline_tokens, 4) if baseline_tokens > 0 else 0.0
     savings_pct = f"{round(savings_ratio * 100, 1)}%"
-    baseline_cost = round((baseline_tokens / 1000) * PRICE_PER_1K_TOKENS, 6)
-    actual_cost = round((actual_total_tokens / 1000) * PRICE_PER_1K_TOKENS, 6)
-    cost_saved = round(max(0.0, baseline_cost - actual_cost), 6)
+    # Cost fields intentionally omitted: pricing varies widely across LLM providers
+    # (GPT-4o, Claude, Gemini, etc.) and cannot be accurately computed here.
+    # Users can calculate cost savings using their own provider pricing.
 
     step_rows = ""
     if step_records:
@@ -335,9 +328,6 @@ def _build_performance_table(
 | **Actual Tokens Used** | {actual_total_tokens:,} |
 | **Tokens Saved** | **{tokens_saved:,}** |
 | **Savings Rate** | **{savings_pct}** |
-| **Baseline Cost** | ${baseline_cost:.6f} USD |
-| **Actual Cost** | ${actual_cost:.6f} USD |
-| **Cost Saved** | **${cost_saved:.6f} USD** |
 {step_section}
 *Powered by [HuangtingFlux](https://huangtingflux.com) · Huangting Protocol V5.1*
 """
