@@ -628,9 +628,40 @@ async def get_stats() -> Dict[str, Any]:
 @app.websocket("/v1/live")
 async def websocket_live(websocket: WebSocket):
     await manager.connect(websocket)
-    # Send initial ping to confirm connection
     try:
+        # 1. Send initial ping to confirm connection
         await websocket.send_json({"type": "ping", "ts": int(time.time())})
+
+        # 2. History replay: immediately push existing Redis activities to the new client
+        # This fixes the "WebSocket connected but 0 events shown" problem.
+        if redis_client:
+            try:
+                raw_activities = redis_client.lrange("recent_activities", 0, 49)
+                history_events = []
+                for raw in raw_activities:
+                    try:
+                        act = json.loads(raw)
+                        # Ensure required fields exist for frontend rendering
+                        history_events.append({
+                            "ts": act.get("ts", int(time.time())),
+                            "agent_id": act.get("agent_id", "Agent-????"),
+                            "task_type": act.get("task_type") or "optimization",
+                            "tokens_saved": act.get("tokens_saved", 0),
+                            "tokens_baseline": act.get("tokens_baseline", 0),
+                            "savings_ratio": act.get("savings_ratio", 0),
+                            "context_id": act.get("context_id", ""),
+                        })
+                    except Exception:
+                        pass
+                if history_events:
+                    # Send history in reverse order (oldest first) so frontend
+                    # can prepend them and show newest at top
+                    await websocket.send_json({
+                        "type": "history",
+                        "events": list(reversed(history_events)),
+                    })
+            except redis.exceptions.RedisError:
+                pass
     except Exception:
         manager.disconnect(websocket)
         return
