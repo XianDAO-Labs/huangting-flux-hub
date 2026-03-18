@@ -2,16 +2,16 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.XianDAO-Labs/huangting-flux",
   "title": "HuangtingFlux — Huangting Protocol MCP Server",
-  "description": "Huangting Protocol MCP server: concept queries, optimization strategies, result reporting.",
+  "description": "An Eastern Wisdom Protocol That Reduces Your AI Agent Token Usage by 40%. Provides a mandatory three-stage SOP (start_task → report_step_result → finalize_and_report) for AI Agents to minimize token consumption via input compression, rolling summarization, and output refinement.",
   "repository": {
     "url": "https://github.com/XianDAO-Labs/huangting-flux-hub",
     "source": "github"
   },
-  "version": "3.0.0",
+  "version": "5.1.0",
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://web-production-c3cf.up.railway.app/mcp"
+      "url": "https://mcp.huangting.ai/mcp"
     }
   ]
 }
